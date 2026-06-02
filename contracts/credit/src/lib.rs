@@ -15,6 +15,7 @@ mod config;
 pub mod events;
 mod freeze;
 mod collateral;
+mod lifecycle;
 mod query;
 mod math_utils;
 mod risk;
@@ -33,6 +34,7 @@ use crate::events::{
     publish_interest_accrued_event, publish_repayment_event, CreditLineEvent, DrawnEvent,
     InterestAccruedEvent, RepaymentEvent,
     publish_oracle_config_set_event, publish_oracle_price_accepted_event,
+    publish_contract_upgraded_event, ContractUpgradedEvent,
 };
 use crate::math_utils::{mul_div, Rounding, compute_deviation_bps};
 use crate::storage::{
@@ -53,7 +55,7 @@ use crate::types::{
     ContractError, CreditLineData, CreditStatus, GracePeriodConfig, GraceWaiverMode,
     OracleConfig, RateChangeConfig,
 };
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Symbol, Vec};
 
 pub const CONTRACT_API_VERSION: (u32, u32, u32) = (1, 0, 0);
 
@@ -74,6 +76,16 @@ const BULK_BLOCK_MAX: u32 = 50;
 /// Maximum borrowers that can be processed in a single keeper accrual batch.
 /// Keeps the entrypoint within Soroban resource limits.
 const ACCRUE_BATCH_MAX: u32 = 50;
+
+#[soroban_sdk::contractclient(name = "AuctionClient")]
+pub trait Auction {
+    fn settle_default_liquidation(
+        env: soroban_sdk::Env,
+        auction_id: soroban_sdk::Symbol,
+        credit_contract: soroban_sdk::Address,
+        borrower: soroban_sdk::Address,
+    ) -> i128;
+}
 
 #[contract]
 pub struct Credit;
@@ -572,6 +584,14 @@ impl Credit {
         storage::get_borrower_rate_floor(&env, &borrower)
     }
 
+    pub fn set_penalty_surcharge_bps(env: Env, bps: u32) {
+        risk::set_penalty_surcharge_bps(env, bps)
+    }
+
+    pub fn get_penalty_surcharge_bps(env: Env) -> u32 {
+        risk::get_penalty_surcharge_bps(env)
+    }
+
     pub fn get_rate_change_limits(env: Env) -> Option<RateChangeConfig> {
         env.storage().instance().get(&rate_cfg_key(&env))
     }
@@ -921,6 +941,15 @@ impl Credit {
         lifecycle::reinstate_credit_line(env, borrower, target_status)
     }
 
+    /// Apply auction liquidation proceeds to a defaulted credit line (admin only).
+    ///
+    /// This is accounting-only: no token transfer occurs here. Off-chain
+    /// orchestration must ensure auction proceeds are in protocol custody
+    /// before invoking this function.
+    ///
+    /// # Reentrancy
+    /// Protected by the contract-wide reentrancy guard to prevent cross-contract
+    /// callback attacks during settlement.
     pub fn settle_default_liquidation(
         env: Env,
         borrower: Address,
@@ -928,43 +957,85 @@ impl Credit {
         settlement_id: Symbol,
         oracle_price: Option<i128>,
     ) {
+        // Reentrancy guard: settlement touches accounting and may interact
+        // with an external auction contract, so we guard the full path.
+        set_reentrancy_guard(&env);
+
         // Oracle price-feed circuit breaker: validate price before settlement.
-        if let Some(cfg) = get_oracle_config(&env) {
+        if let Some(cfg) = crate::storage::get_oracle_config(&env) {
             let price = oracle_price.unwrap_or_else(|| {
+                clear_reentrancy_guard(&env);
                 env.panic_with_error(ContractError::OraclePriceInvalid)
             });
 
             if price <= 0 {
+                clear_reentrancy_guard(&env);
                 env.panic_with_error(ContractError::OraclePriceInvalid);
             }
 
             let now = env.ledger().timestamp();
 
-            // Staleness check: price timestamp must be recent enough.
-            // The caller supplies the oracle price; we track when it was last accepted.
-            // On first call (no stored price), we accept and store without deviation check.
-            if let Some(last_ts) = get_oracle_last_price_ts(&env) {
+            if let Some(last_ts) = crate::storage::get_oracle_last_price_ts(&env) {
                 let age = now.saturating_sub(last_ts);
                 if age > cfg.max_age_seconds {
+                    clear_reentrancy_guard(&env);
                     env.panic_with_error(ContractError::OraclePriceStale);
                 }
 
-                // Deviation check against last accepted price.
-                if let Some(last_price) = get_oracle_last_price(&env) {
+                if let Some(last_price) = crate::storage::get_oracle_last_price(&env) {
                     let deviation = compute_deviation_bps(price, last_price)
-                        .unwrap_or_else(|| env.panic_with_error(ContractError::OraclePriceInvalid));
+                        .unwrap_or_else(|| {
+                            clear_reentrancy_guard(&env);
+                            env.panic_with_error(ContractError::OraclePriceInvalid)
+                        });
                     if deviation > cfg.max_deviation_bps {
+                        clear_reentrancy_guard(&env);
                         env.panic_with_error(ContractError::OraclePriceDeviation);
                     }
                 }
             }
 
-            // Accept and persist the new price.
-            set_oracle_last_price(&env, price, now);
+            crate::storage::set_oracle_last_price(&env, price, now);
             publish_oracle_price_accepted_event(&env, price, now);
         }
 
-        lifecycle::settle_default_liquidation(env, borrower, recovered_amount, settlement_id)
+        // Wire the auction contract settlement hook if configured.
+        if let Some(auction_addr) = crate::storage::get_auction_contract(&env) {
+            let auction_client = AuctionClient::new(&env, &auction_addr);
+            let auction_recovered = auction_client.settle_default_liquidation(
+                &settlement_id,
+                &env.current_contract_address(),
+                &borrower,
+            );
+            if auction_recovered != recovered_amount {
+                clear_reentrancy_guard(&env);
+                env.panic_with_error(ContractError::InvalidAmount);
+            }
+        }
+
+        lifecycle::settle_default_liquidation(env.clone(), borrower, recovered_amount, settlement_id);
+        clear_reentrancy_guard(&env);
+    }
+
+    // ── Auction contract admin ────────────────────────────────────────────────
+
+    /// Configure the auction contract address for default-liquidation hooks.
+    ///
+    /// When set, the credit contract records which auction contract is
+    /// authorized to participate in the liquidation settlement flow. This
+    /// address is stored in instance storage and can be updated by the admin.
+    ///
+    /// # Authorization
+    /// Admin only.
+    pub fn set_auction_contract(env: Env, auction_address: Address) {
+        assert_not_paused(&env);
+        require_admin_auth(&env);
+        crate::storage::set_auction_contract(&env, &auction_address);
+    }
+
+    /// Return the configured auction contract address, if set.
+    pub fn get_auction_contract(env: Env) -> Option<Address> {
+        crate::storage::get_auction_contract(&env)
     }
 
     // ── Oracle circuit-breaker admin ──────────────────────────────────────────
@@ -1215,6 +1286,72 @@ impl Credit {
             liquidity_token: env.storage().instance().get(&DataKey::LiquidityToken),
             liquidity_source: env.storage().instance().get(&DataKey::LiquiditySource),
         }
+    }
+
+    // ── Contract Upgrade ──────────────────────────────────────────────────────
+
+    /// Upgrade the contract WASM to a new version (admin only).
+    ///
+    /// This entrypoint allows the protocol to ship bug fixes and feature additions
+    /// without migrating borrower state. The upgrade is atomic and preserves all
+    /// existing storage.
+    ///
+    /// # Security Gates
+    /// - **Admin authentication**: Only the configured admin can authorize upgrades.
+    /// - **Pause check**: Upgrades are blocked when the protocol circuit breaker is active.
+    ///
+    /// # State Updates
+    /// - Bumps `SCHEMA_VERSION` in instance storage to track upgrade history.
+    /// - Calls `env.deployer().update_current_contract_wasm(new_wasm_hash)` to perform
+    ///   the atomic WASM replacement.
+    ///
+    /// # Events
+    /// Emits `ContractUpgradedEvent` with both the old and new WASM hashes for
+    /// off-chain indexers and audit trails.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: The 32-byte hash of the new WASM binary to deploy.
+    ///
+    /// # Authorization
+    /// Requires admin authorization via `require_admin_auth()`.
+    ///
+    /// # Errors
+    /// - `ContractError::Paused` — Protocol is paused by the emergency circuit breaker.
+    /// - Auth error — Caller is not the configured admin.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Deploy new WASM and get its hash
+    /// let new_wasm_hash = env.deployer().upload_contract_wasm(new_wasm);
+    /// 
+    /// // Upgrade the contract
+    /// client.upgrade(&new_wasm_hash);
+    /// ```
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        // Enforce pause check: upgrades are blocked during emergency circuit breaker.
+        assert_not_paused(&env);
+        
+        // Enforce admin authentication: only the configured admin can upgrade.
+        require_admin_auth(&env);
+
+        // Retrieve the current WASM hash before upgrade for event emission.
+        let old_wasm_hash = env.deployer().get_current_contract_wasm();
+
+        // Bump schema version to track upgrade history.
+        let current_version = crate::storage::get_schema_version(&env).unwrap_or(SCHEMA_VERSION);
+        crate::storage::set_schema_version(&env, current_version.saturating_add(1));
+
+        // Perform the atomic WASM upgrade.
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Emit upgrade event for off-chain indexers and audit trails.
+        publish_contract_upgraded_event(
+            &env,
+            ContractUpgradedEvent {
+                old_wasm_hash,
+                new_wasm_hash,
+            },
+        );
     }
 }
 
@@ -5308,9 +5445,5 @@ mod test_max_repay_amount {
         let (client, _admin, _borrower, _token) = setup_with_token(&env);
 
         client.set_max_repay_amount(&0_i128);
-        }
     }
-
-    }
-}
 }

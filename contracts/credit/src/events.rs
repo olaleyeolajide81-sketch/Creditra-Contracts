@@ -122,6 +122,23 @@ pub struct FeeAccruedEvent {
     pub new_treasury_balance: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PenaltyRateEnteredEvent {
+    pub borrower: Address,
+    pub base_rate_bps: u32,
+    pub penalty_surcharge_bps: u32,
+    pub effective_rate_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PenaltyRateExitedEvent {
+    pub borrower: Address,
+    pub previous_rate_bps: u32,
+    pub new_rate_bps: u32,
+}
+
 pub fn publish_credit_line_event(env: &Env, topic: (Symbol, Symbol), event: CreditLineEvent) {
     env.events().publish(topic, event);
 }
@@ -151,7 +168,7 @@ pub fn publish_drawn_event_v2(env: &Env, event: DrawnEventV2) {
 
 pub fn publish_fee_accrued_event(env: &Env, event: FeeAccruedEvent) {
     env.events()
-    .publish((symbol_short!("credit"), symbol_short!("fee_accrd")), event);
+        .publish((symbol_short!("credit"), symbol_short!("fee_accrd")), event);
 }
 
 pub fn publish_admin_rotation_proposed(env: &Env, proposed_admin: &Address, accept_after: u64) {
@@ -250,6 +267,42 @@ pub fn publish_borrower_blocked_event(env: &Env, borrower: &Address, blocked: bo
     );
 }
 
+/// Publish a penalty rate entered event when a line becomes delinquent.
+pub fn publish_penalty_rate_entered_event(
+    env: &Env,
+    borrower: &Address,
+    base_rate_bps: u32,
+    penalty_surcharge_bps: u32,
+    effective_rate_bps: u32,
+) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "pen_enter")),
+        PenaltyRateEnteredEvent {
+            borrower: borrower.clone(),
+            base_rate_bps,
+            penalty_surcharge_bps,
+            effective_rate_bps,
+        },
+    );
+}
+
+/// Publish a penalty rate exited event when a line is no longer delinquent.
+pub fn publish_penalty_rate_exited_event(
+    env: &Env,
+    borrower: &Address,
+    previous_rate_bps: u32,
+    new_rate_bps: u32,
+) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "pen_exit")),
+        PenaltyRateExitedEvent {
+            borrower: borrower.clone(),
+            previous_rate_bps,
+            new_rate_bps,
+        },
+    );
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollateralDepositedEvent {
@@ -274,4 +327,29 @@ pub fn publish_collateral_deposited_event(env: &Env, event: CollateralDepositedE
 pub fn publish_collateral_withdrawn_event(env: &Env, event: CollateralWithdrawnEvent) {
     env.events()
         .publish((symbol_short!("credit"), symbol_short!("col_wit")), event);
+}
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgradedEvent {
+    pub old_wasm_hash: soroban_sdk::BytesN<32>,
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+}
+
+pub fn publish_contract_upgraded_event(env: &Env, event: ContractUpgradedEvent) {
+    env.events()
+        .publish((symbol_short!("credit"), Symbol::new(env, "upgraded")), event);
+}
+
+pub fn publish_oracle_config_set_event(env: &Env, max_deviation_bps: u32, max_age_seconds: u64) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "orc_cfg")),
+        (max_deviation_bps, max_age_seconds),
+    );
+}
+
+pub fn publish_oracle_price_accepted_event(env: &Env, price: i128, timestamp: u64) {
+    env.events().publish(
+        (symbol_short!("credit"), Symbol::new(env, "orc_price")),
+        (price, timestamp),
+    );
 }
